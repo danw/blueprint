@@ -262,7 +262,7 @@ default ${g.bootstrap.BinDir}/minibp
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Singleton: bootstrap
-# Factory:   github.com/google/blueprint/bootstrap.func·008
+# Factory:   github.com/google/blueprint/bootstrap.func·009
 
 rule s.bootstrap.primarybp
     command = ${g.bootstrap.BinDir}/minibp --build-primary ${runTests} -m ${g.bootstrap.bootstrapManifest} --timestamp ${timestamp} --timestampdep ${timestampdep} -b ${g.bootstrap.buildDir} -d ${outfile}.d -o ${outfile} ${in}

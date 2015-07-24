@@ -29,8 +29,9 @@ const miniBootstrapDir = "$buildDir/.minibootstrap"
 var (
 	pctx = blueprint.NewPackageContext("github.com/google/blueprint/bootstrap")
 
-	goTestMainCmd  = pctx.StaticVariable("goTestMainCmd", filepath.Join(bootstrapDir, "bin", "gotestmain"))
-	chooseStageCmd = pctx.StaticVariable("chooseStageCmd", filepath.Join(bootstrapDir, "bin", "choosestage"))
+	goTestMainCmd   = pctx.StaticVariable("goTestMainCmd", filepath.Join(bootstrapDir, "bin", "gotestmain"))
+	chooseStageCmd  = pctx.StaticVariable("chooseStageCmd", filepath.Join(bootstrapDir, "bin", "choosestage"))
+	pluginGenSrcCmd = pctx.StaticVariable("pluginGenSrcCmd", filepath.Join(bootstrapDir, "bin", "loadplugins"))
 
 	compile = pctx.StaticRule("compile",
 		blueprint.RuleParams{
@@ -53,6 +54,13 @@ var (
 			Description: "gotestmain $out",
 		},
 		"pkg")
+
+	pluginGenSrc = pctx.StaticRule("pluginGenSrc",
+		blueprint.RuleParams{
+			Command:     "$pluginGenSrcCmd -o $out $plugins",
+			Description: "create $out",
+		},
+		"plugins")
 
 	test = pctx.StaticRule("test",
 		blueprint.RuleParams{
@@ -102,6 +110,8 @@ var (
 	minibpFile = filepath.Join("$BinDir", "minibp")
 
 	docsDir = filepath.Join(bootstrapDir, "docs")
+
+	primaryBuilderPlugins = []string{}
 )
 
 type bootstrapGoCore interface {
@@ -119,6 +129,14 @@ func propagateStageBootstrap(mctx blueprint.TopDownMutatorContext) {
 			m.SetBuildStage(StageBootstrap)
 		}
 	})
+}
+
+func primaryBuilderPluginFinder(ctx blueprint.EarlyMutatorContext) {
+	if pkg, ok := ctx.Module().(*goPackage); ok {
+		if pkg.properties.Plugin {
+			primaryBuilderPlugins = append(primaryBuilderPlugins, ctx.ModuleName())
+		}
+	}
 }
 
 type goPackageProducer interface {
@@ -141,6 +159,18 @@ func isGoTestProducer(module blueprint.Module) bool {
 	return ok
 }
 
+type goPluginProvider interface {
+	GoPkgPath() string
+	IsPlugin() bool
+}
+
+func isGoPlugin(module blueprint.Module) bool {
+	if plugin, ok := module.(goPluginProvider); ok {
+		return plugin.IsPlugin()
+	}
+	return false
+}
+
 func isBootstrapModule(module blueprint.Module) bool {
 	_, isPackage := module.(*goPackage)
 	_, isBinary := module.(*goBinary)
@@ -158,6 +188,7 @@ type goPackage struct {
 		PkgPath  string
 		Srcs     []string
 		TestSrcs []string
+		Plugin   bool
 	}
 
 	// The root dir in which the package .a file is located.  The full .a file
@@ -189,6 +220,10 @@ func newGoPackageModuleFactory(config *Config) func() (blueprint.Module, []inter
 	}
 }
 
+func (g *goPackage) GoPkgPath() string {
+	return g.properties.PkgPath
+}
+
 func (g *goPackage) GoPkgRoot() string {
 	return g.pkgRoot
 }
@@ -207,6 +242,10 @@ func (g *goPackage) BuildStage() Stage {
 
 func (g *goPackage) SetBuildStage(buildStage Stage) {
 	g.buildStage = buildStage
+}
+
+func (g *goPackage) IsPlugin() bool {
+	return g.properties.Plugin
 }
 
 func (g *goPackage) GenerateBuildActions(ctx blueprint.ModuleContext) {
@@ -235,17 +274,17 @@ func (g *goPackage) GenerateBuildActions(ctx blueprint.ModuleContext) {
 
 		if g.config.runGoTests {
 			deps = buildGoTest(ctx, testRoot(ctx), g.testArchiveFile,
-				g.properties.PkgPath, g.properties.Srcs,
+				g.properties.PkgPath, g.properties.Srcs, nil,
 				g.properties.TestSrcs)
 		}
 
 		buildGoPackage(ctx, g.pkgRoot, g.properties.PkgPath, g.archiveFile,
-			g.properties.Srcs, deps)
+			g.properties.Srcs, nil, deps)
 	} else if g.config.stage != StageBootstrap {
 		if len(g.properties.TestSrcs) > 0 && g.config.runGoTests {
-			phonyGoTarget(ctx, g.testArchiveFile, g.properties.TestSrcs, nil)
+			phonyGoTarget(ctx, g.testArchiveFile, g.properties.TestSrcs, nil, nil)
 		}
-		phonyGoTarget(ctx, g.archiveFile, g.properties.Srcs, nil)
+		phonyGoTarget(ctx, g.archiveFile, g.properties.Srcs, nil, nil)
 	}
 }
 
@@ -289,6 +328,13 @@ func (g *goBinary) SetBuildStage(buildStage Stage) {
 	g.buildStage = buildStage
 }
 
+func (g *goBinary) DynamicDependencies(ctx blueprint.DynamicDependerModuleContext) []string {
+	if g.properties.PrimaryBuilder {
+		return primaryBuilderPlugins
+	}
+	return []string{}
+}
+
 func (g *goBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 	var (
 		name        = ctx.ModuleName()
@@ -296,10 +342,17 @@ func (g *goBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 		archiveFile = filepath.Join(objDir, name+".a")
 		aoutFile    = filepath.Join(objDir, "a.out")
 		binaryFile  = filepath.Join("$BinDir", name)
+		pluginSrc   = ""
+		genSrcs     = []string{}
 	)
 
 	if len(g.properties.TestSrcs) > 0 && g.config.runGoTests {
 		g.testArchiveFile = filepath.Join(testRoot(ctx), name+".a")
+	}
+
+	if g.properties.PrimaryBuilder && len(primaryBuilderPlugins) > 0 {
+		pluginSrc = filepath.Join(objDir, "plugin.go")
+		genSrcs = append(genSrcs, pluginSrc)
 	}
 
 	// We only actually want to build the builder modules if we're running as
@@ -310,12 +363,31 @@ func (g *goBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 	if g.config.stage == g.BuildStage() {
 		var deps []string
 
-		if g.config.runGoTests {
-			deps = buildGoTest(ctx, testRoot(ctx), g.testArchiveFile,
-				name, g.properties.Srcs, g.properties.TestSrcs)
+		if pluginSrc != "" {
+			plugins := []string{}
+
+			ctx.VisitDepsDepthFirstIf(isGoPlugin,
+				func(module blueprint.Module) {
+					plugin := module.(goPluginProvider)
+					plugins = append(plugins, plugin.GoPkgPath())
+				})
+
+			ctx.Build(pctx, blueprint.BuildParams{
+				Rule:      pluginGenSrc,
+				Outputs:   []string{pluginSrc},
+				Implicits: []string{"$pluginGenSrcCmd"},
+				Args: map[string]string{
+					"plugins": strings.Join(plugins, " "),
+				},
+			})
 		}
 
-		buildGoPackage(ctx, objDir, name, archiveFile, g.properties.Srcs, deps)
+		if g.config.runGoTests {
+			deps = buildGoTest(ctx, testRoot(ctx), g.testArchiveFile,
+				name, g.properties.Srcs, genSrcs, g.properties.TestSrcs)
+		}
+
+		buildGoPackage(ctx, objDir, name, archiveFile, g.properties.Srcs, genSrcs, deps)
 
 		var libDirFlags []string
 		ctx.VisitDepsDepthFirstIf(isGoPackageProducer,
@@ -345,19 +417,20 @@ func (g *goBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 		})
 	} else if g.config.stage != StageBootstrap {
 		if len(g.properties.TestSrcs) > 0 && g.config.runGoTests {
-			phonyGoTarget(ctx, g.testArchiveFile, g.properties.TestSrcs, nil)
+			phonyGoTarget(ctx, g.testArchiveFile, g.properties.TestSrcs, nil, nil)
 		}
 
 		intermediates := []string{aoutFile, archiveFile}
-		phonyGoTarget(ctx, binaryFile, g.properties.Srcs, intermediates)
+		phonyGoTarget(ctx, binaryFile, g.properties.Srcs, genSrcs, intermediates)
 	}
 }
 
 func buildGoPackage(ctx blueprint.ModuleContext, pkgRoot string,
-	pkgPath string, archiveFile string, srcs []string, orderDeps []string) {
+	pkgPath string, archiveFile string, srcs []string, genSrcs []string, orderDeps []string) {
 
 	srcDir := moduleSrcDir(ctx)
 	srcFiles := pathtools.PrefixPaths(srcs, srcDir)
+	srcFiles = append(srcFiles, genSrcs...)
 
 	var incFlags []string
 	deps := []string{"$compileCmd"}
@@ -388,9 +461,8 @@ func buildGoPackage(ctx blueprint.ModuleContext, pkgRoot string,
 	})
 }
 
-func buildGoTest(ctx blueprint.ModuleContext, testRoot string,
-	testPkgArchive string, pkgPath string, srcs []string,
-	testSrcs []string) []string {
+func buildGoTest(ctx blueprint.ModuleContext, testRoot, testPkgArchive,
+	pkgPath string, srcs, genSrcs, testSrcs []string) []string {
 
 	if len(testSrcs) == 0 {
 		return nil
@@ -405,7 +477,7 @@ func buildGoTest(ctx blueprint.ModuleContext, testRoot string,
 	testPassed := filepath.Join(testRoot, "test.passed")
 
 	buildGoPackage(ctx, testRoot, pkgPath, testPkgArchive,
-		append(srcs, testSrcs...), nil)
+		append(srcs, testSrcs...), genSrcs, nil)
 
 	ctx.Build(pctx, blueprint.BuildParams{
 		Rule:      goTestMain,
@@ -460,7 +532,7 @@ func buildGoTest(ctx blueprint.ModuleContext, testRoot string,
 }
 
 func phonyGoTarget(ctx blueprint.ModuleContext, target string, srcs []string,
-	intermediates []string) {
+	gensrcs []string, intermediates []string) {
 
 	var depTargets []string
 	ctx.VisitDepsDepthFirstIf(isGoPackageProducer,
@@ -472,6 +544,7 @@ func phonyGoTarget(ctx blueprint.ModuleContext, target string, srcs []string,
 
 	moduleDir := ctx.ModuleDir()
 	srcs = pathtools.PrefixPaths(srcs, filepath.Join("$srcDir", moduleDir))
+	srcs = append(srcs, gensrcs...)
 
 	ctx.Build(pctx, blueprint.BuildParams{
 		Rule:      phony,
