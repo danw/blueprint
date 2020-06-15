@@ -9,17 +9,20 @@ on:
 jobs:
 
   build:
-    name: Build
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: [ '1.14', '1.13' ]
+    name: Build and test on go ${{ matrix.go }}
     steps:
 
-    - name: Set up Go 1.x
+    - name: Set up Go ${{ matrix.go }}
       uses: actions/setup-go@v2.0.3
       with:
-        go-version: ^1.13
+        go-version: ${{ matrix.go }}
       id: go
 
-    - name: Check out code into the Go module directory
+    - name: Check out code
       uses: actions/checkout@v2.2.0
 
     - name: Install ninja
@@ -31,14 +34,14 @@ jobs:
         echo "::add-path::${GITHUB_WORKSPACE}/ninja-bin"
 
     - name: Run gofmt
-      run: ./.travis.gofmt.sh
+      run: ./.gofmt.sh
 
     - name: Test
       run: go test ./...
-    
+
     - name: Test with race detector
       run: go test -race -short ./...
-    
+
     - run: ./tests/test.sh
     - run: ./tests/test_tree_tests.sh
     - run: ./tests/test_tree_tests.sh -t
