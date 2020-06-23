@@ -32,6 +32,7 @@ import (
 	"sync/atomic"
 	"text/scanner"
 	"text/template"
+	"time"
 
 	"github.com/google/blueprint/parser"
 	"github.com/google/blueprint/pathtools"
@@ -130,6 +131,113 @@ type Context struct {
 
 	// Can be set by tests to avoid invalidating Module values after mutators.
 	skipCloneModulesAfterMutators bool
+
+	metrics Metrics
+}
+
+type Metrics struct {
+	Singletons           []Metric
+	Mutators             []Metric
+	Parse                Metric
+	GenerateBuildActions Metric
+	WriteNinja           Metric
+}
+
+func (m *Metrics) Print() {
+	total := &Metric{}
+
+	fmt.Println("Parse:")
+	m.Parse.Print("  ")
+	total.Add(m.Parse)
+
+	fmt.Println("GenerateBuildActions:")
+	m.GenerateBuildActions.Print("  ")
+	total.Add(m.GenerateBuildActions)
+
+	fmt.Println("WriteNinja:")
+	m.WriteNinja.Print("  ")
+	total.Add(m.WriteNinja)
+
+	fmt.Println("Singletons:")
+	sTotal := &Metric{}
+	sort.Slice(m.Singletons, func(i, j int) bool {
+		return m.Singletons[i].Length < m.Singletons[j].Length
+	})
+	for _, s := range m.Singletons {
+		fmt.Printf("  %s:\n", s.Name)
+		s.Print("    ")
+		sTotal.Add(s)
+	}
+
+	fmt.Println("  Total:")
+	sTotal.Print("    ")
+	total.Add(*sTotal)
+
+	fmt.Println("Mutators:")
+	mTotal := &Metric{}
+	sort.Slice(m.Mutators, func(i, j int) bool {
+		return m.Mutators[i].Length < m.Mutators[j].Length
+	})
+	for _, s := range m.Mutators {
+		fmt.Printf("  %s:\n", s.Name)
+		s.Print("    ")
+		mTotal.Add(s)
+	}
+
+	fmt.Println("  Total:")
+	mTotal.Print("    ")
+	total.Add(*mTotal)
+
+	fmt.Println("Total:")
+	total.Print("  ")
+}
+
+type Metric struct {
+	Name      string
+	Length    time.Duration
+	Allocs    uint64
+	AllocSize uint64
+}
+
+func (m *Metric) Add(other Metric) {
+	m.Length += other.Length
+	m.Allocs += other.Allocs
+	m.AllocSize += other.AllocSize
+}
+
+func (m *Metric) Print(prefix string) {
+	fmt.Printf("%sTime: %s\n", prefix, m.Length.Round(time.Millisecond))
+	fmt.Printf("%sAllocs: %dk\n", prefix, m.Allocs/1000)
+	fmt.Printf("%sSize: %dMB\n", prefix, m.AllocSize/1024/1024)
+}
+
+type pendingMetric struct {
+	name      string
+	start     time.Time
+	allocs    uint64
+	allocSize uint64
+}
+
+func startMetric(name string) pendingMetric {
+	memStats := runtime.MemStats{}
+	runtime.ReadMemStats(&memStats)
+	return pendingMetric{
+		name:      name,
+		start:     time.Now(),
+		allocs:    memStats.Mallocs,
+		allocSize: memStats.TotalAlloc,
+	}
+}
+
+func (t *pendingMetric) done() Metric {
+	memStats := runtime.MemStats{}
+	runtime.ReadMemStats(&memStats)
+	return Metric{
+		Name:      t.name,
+		Length:    time.Since(t.start),
+		Allocs:    memStats.Mallocs - t.allocs,
+		AllocSize: memStats.TotalAlloc - t.allocSize,
+	}
 }
 
 // An Error describes a problem that was encountered that is related to a
@@ -807,6 +915,8 @@ func (c *Context) ParseFileList(rootDir string, filePaths []string,
 		}
 	}
 
+	metric := startMetric("")
+
 	atomic.AddInt32(&numGoroutines, 1)
 	go func() {
 		var errs []error
@@ -837,6 +947,7 @@ loop:
 			}
 		}
 	}
+	c.metrics.Parse = metric.done()
 
 	return deps, errs
 }
@@ -2279,8 +2390,10 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 			deps = append(deps, extraDeps...)
 		}
 
+		metric := startMetric("")
 		var depsModules []string
 		depsModules, errs = c.generateModuleBuildActions(config, c.liveGlobals)
+		c.metrics.GenerateBuildActions = metric.done()
 		if len(errs) > 0 {
 			return
 		}
@@ -2514,6 +2627,7 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 	}()
 
 	c.startedMutator = mutator
+	metric := startMetric(mutator.name)
 
 	var visitErrs []error
 	if mutator.parallel {
@@ -2521,6 +2635,7 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 	} else {
 		direction.orderer().visit(c.modulesSorted, visit)
 	}
+	c.metrics.Mutators = append(c.metrics.Mutators, metric.done())
 
 	if len(visitErrs) > 0 {
 		return nil, visitErrs
@@ -2821,7 +2936,9 @@ func (c *Context) generateSingletonBuildActions(config interface{},
 					}
 				}
 			}()
+			metric := startMetric(info.name)
 			info.singleton.GenerateBuildActions(sctx)
+			c.metrics.Singletons = append(c.metrics.Singletons, metric.done())
 		}()
 
 		if len(sctx.errs) > 0 {
@@ -3280,6 +3397,10 @@ func (c *Context) AllTargets() (map[string]string, error) {
 	return targets, nil
 }
 
+func (c *Context) GetMetrics() *Metrics {
+	return &c.metrics
+}
+
 func (c *Context) NinjaBuildDir() (string, error) {
 	if c.ninjaBuildDir != nil {
 		return c.ninjaBuildDir.Eval(c.globalVariables)
@@ -3490,6 +3611,8 @@ func (c *Context) WriteBuildFile(w io.Writer) error {
 			return
 		}
 
+		metric := startMetric("")
+
 		nw := newNinjaWriter(w)
 
 		err = c.writeBuildFileHeader(nw)
@@ -3538,6 +3661,8 @@ func (c *Context) WriteBuildFile(w io.Writer) error {
 		if err != nil {
 			return
 		}
+
+		c.metrics.WriteNinja = metric.done()
 	})
 
 	if err != nil {
